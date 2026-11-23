@@ -287,7 +287,7 @@ export function ScheduleFields({ v, set }: { v: AutopilotFormValues; set: SetFn 
           label="AI calls per day"
           value={v.ai_daily_cap}
           min={0}
-          max={5000}
+          max={1000}
           onChange={(n) => set("ai_daily_cap", n)}
           hint="Cost cap. The autopilot pauses when it's reached."
         />

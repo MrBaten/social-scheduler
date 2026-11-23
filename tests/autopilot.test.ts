@@ -8,16 +8,21 @@ import { HttpError } from "../lib/api";
 import type { SocialAccountPublic } from "../lib/types";
 import { normalizeUrl, titleKey, containsTerm, tokenize } from "../lib/autopilot/text";
 import { parseFeed, parseGdelt, parseGdeltDate } from "../lib/autopilot/feeds";
+import { htmlToText } from "../lib/autopilot/text";
+import { SOURCE_ADAPTERS } from "../lib/autopilot/sources";
 import { googleNewsUrl, gdeltUrl } from "../lib/autopilot/sources";
 import { scoreItem, type NicheProfile } from "../lib/autopilot/relevance";
 import { ingestSource, processNewItems, storeItems, MAX_SOURCE_ERRORS } from "../lib/autopilot/ingest";
 import { localDayKey, nextFreeSlot, openSlot, slotsForDay, zonedToUtc, type SlotConfig } from "../lib/autopilot/slots";
-import { assertPublicUrl, isPrivateIp, FetchError } from "../lib/autopilot/fetcher";
+import { assertPublicUrl, checkUrl, isPrivateIp, FetchError } from "../lib/autopilot/fetcher";
 import { aiStatus, extractJsonObject, type AiClient } from "../lib/autopilot/ai";
 import { ensureCredit, fillTemplate, generatePosts } from "../lib/autopilot/generate";
 import {
   addSource,
+  addTemplate,
   createAutopilot,
+  deleteTemplate,
+  updateTemplate,
   deleteAutopilot,
   editDraft,
   getDraft,
@@ -31,7 +36,7 @@ import {
   updateSource,
 } from "../lib/autopilot/store";
 import { approveDraft } from "../lib/autopilot/handoff";
-import { pickTopic, runAutopilot, summarizeAutopilots } from "../lib/autopilot/pipeline";
+import { pickTopic, pruneOld, regenerateDraft, runAutopilot, summarizeAutopilots } from "../lib/autopilot/pipeline";
 import { autopilotTick } from "../lib/autopilot/worker";
 import type { ApItemRow, ApSourceRow, ApTopicRow, AutopilotRow, FeedItem } from "../lib/autopilot/types";
 import { ATOM_FIXTURE, GDELT_FIXTURE, GOOGLE_NEWS_FIXTURE, RSS_FIXTURE, item } from "./autopilot.fixtures";
@@ -144,6 +149,24 @@ describe("text + parsers", () => {
     expect(parseFeed("<html>garbage</html>").items).toEqual([]);
   });
 
+  it("parses hostile input in linear time (review finding: regex backtracking)", () => {
+    const t0 = Date.now();
+    expect(parseFeed("<rss><channel>" + "<item>".repeat(170_000)).items).toEqual([]);
+    expect(parseFeed("<feed><entry>" + "<link ".repeat(150_000)).items).toEqual([]);
+    htmlToText("<script".repeat(150_000));
+    htmlToText("<".repeat(1_000_000));
+    htmlToText("<![CDATA[".repeat(100_000));
+    expect(Date.now() - t0).toBeLessThan(2000);
+    // a 1 MB feed of real items stops at 200
+    const many = "<rss><channel>" + Array.from({ length: 3000 }, (_, i) => `<item><title>T${i}</title><link>https://x.example/${i}</link></item>`).join("") + "</channel></rss>";
+    expect(parseFeed(many).items).toHaveLength(200);
+  });
+
+  it("treats a web page returned for a feed URL as a failure (so auto-pause can fire)", () => {
+    expect(() => SOURCE_ADAPTERS.rss.parse("<!doctype html><html><body>Not found</body></html>")).toThrow(/Not an RSS/);
+    expect(SOURCE_ADAPTERS.google_news.parse("<?xml version='1.0'?><rss><channel><title>empty</title></channel></rss>")).toEqual([]);
+  });
+
   it("builds Google News and GDELT request URLs", () => {
     const g = new URL(googleNewsUrl("প্রযুক্তি বাংলাদেশ", { hl: "bn", gl: "bd" }));
     expect(g.origin + g.pathname).toBe("https://news.google.com/rss/search");
@@ -171,6 +194,26 @@ describe("safe fetch guard", () => {
     await expect(assertPublicUrl("http://app.railway.internal/", publicLookup)).rejects.toThrow(/not allowed/);
     await expect(assertPublicUrl("file:///etc/passwd", publicLookup)).rejects.toThrow(/http/);
     await expect(assertPublicUrl("http://user:pw@news.example/", publicLookup)).rejects.toThrow(/credentials/);
+  });
+
+  it("unwraps IPv6 forms that embed IPv4 (review finding: mapped-IPv6 bypass)", () => {
+    // WHATWG URL rewrites [::ffff:127.0.0.1] to ::ffff:7f00:1 — must still be refused.
+    for (const u of [
+      "http://[::ffff:127.0.0.1]:3000/",
+      "http://[::ffff:169.254.169.254]/",
+      "http://[::ffff:0:10.0.0.1]/",
+      "http://[::7f00:1]/",
+      "http://[64:ff9b::a9fe:a9fe]/",
+      "http://[2002:7f00:1::]/",
+      "http://[2001:0:4136:e378::1]/",
+      "http://[fe80::1]/",
+      "http://[::]/",
+    ]) {
+      expect(() => checkUrl(u), u).toThrow(FetchError);
+    }
+    expect(isPrivateIp("2606:4700:4700::1111")).toBe(false);
+    expect(isPrivateIp("::ffff:8.8.8.8")).toBe(false);
+    expect(() => checkUrl("http://[2606:4700:4700::1111]/feed")).not.toThrow();
   });
 });
 
@@ -453,6 +496,29 @@ describe("AutoPilot with the database", () => {
       expect(updateSource(alice, ap.id, rss.id, { enabled: true })).toMatchObject({ enabled: true, error_count: 0, last_error: null });
     });
 
+    it("doesn't log a run row for every quiet worker tick (review finding: ap_runs flood)", async () => {
+      const ap = makeAutopilot(alice, [a.fb]);
+      const off = new Date(NOW.getTime() - 10 * 60_000); // slot open, sources fetched, but nothing relevant
+      await runAutopilot(ap.id, { trigger: "worker", fetcher: async () => [], ai: null, now: off });
+      for (let i = 1; i <= 10; i++) {
+        await runAutopilot(ap.id, { trigger: "worker", fetcher: async () => [], ai: null, now: new Date(off.getTime() + i * 60_000) });
+      }
+      const n = (getDb().prepare("SELECT COUNT(*) AS n FROM ap_runs WHERE autopilot_id = ?").get(ap.id) as { n: number }).n;
+      expect(n).toBe(1); // only the tick that actually fetched the source
+    });
+
+    it("prunes old items, topics and runs but keeps drafts", async () => {
+      const ap = makeAutopilot(alice, [a.fb]);
+      const r = await runAutopilot(ap.id, { trigger: "manual", forceFetch: true, forceGenerate: true, fetcher: async () => STORY, ai: null, now: NOW });
+      const later = new Date(NOW.getTime() + 40 * 86_400_000);
+      const p = pruneOld(later);
+      expect(p.items).toBe(4);
+      expect(p.runs).toBe(1);
+      const d = getDraft(alice, r.draft_id!)!;
+      expect(d.headline).toMatch(/5G/);
+      expect(d.topic_id).toBeNull();
+    });
+
     it("pickTopic prefers bigger/fresher stories and skips archived ones", async () => {
       const ap = makeAutopilot(alice, [a.fb]);
       storeItems(ap.id, null, STORY, NOW);
@@ -536,6 +602,26 @@ describe("AutoPilot with the database", () => {
       expect(qd.draft.status).toBe("approved");
     });
 
+    it("leaves out only the platforms that can't take the attached image type (review finding: PNG/WebP)", async () => {
+      const ap = makeAutopilot(alice, [a.fb, a.ig, a.li]);
+      const draftId = await draftFor(alice, ap.id);
+      const png = insertImage(alice);
+      getDb().prepare("UPDATE media SET mime_type = 'image/png' WHERE id = ?").run(png);
+      editDraft(alice, draftId, { image_media_id: png });
+      const res = approveDraft(alice, draftId, { when: "now" }, NOW);
+      expect(res.post.targets.map((t) => t.platform).sort()).toEqual(["facebook", "linkedin"]);
+      expect(res.skipped).toEqual([expect.objectContaining({ platform: "instagram", reason: expect.stringMatching(/JPEG/) })]);
+
+      const ap2 = makeAutopilot(alice, [a.fb, a.li], { name: "webp" });
+      const d2 = await draftFor(alice, ap2.id);
+      const webp = insertImage(alice);
+      getDb().prepare("UPDATE media SET mime_type = 'image/webp' WHERE id = ?").run(webp);
+      editDraft(alice, d2, { image_media_id: webp });
+      const r2 = approveDraft(alice, d2, { when: "now" }, NOW);
+      expect(r2.post.targets.map((t) => t.platform)).toEqual(["facebook"]);
+      expect(r2.skipped[0]).toMatchObject({ platform: "linkedin" });
+    });
+
     it("rejects with a reason and refuses Instagram-only approval without an image", async () => {
       const ap = makeAutopilot(alice, [a.ig]);
       const draftId = await draftFor(alice, ap.id);
@@ -606,6 +692,41 @@ describe("AutoPilot with the database", () => {
       const src = addSource(alice, ap.id, { type: "google_news", label: "GN", query: "Dhaka tech", interval_minutes: 30, params: { hl: "bn", gl: "BD" } });
       const off = updateSource(alice, ap.id, src.id, { enabled: false });
       expect(off).toMatchObject({ enabled: false, label: "GN", interval_minutes: 30, query: "Dhaka tech", params: { hl: "bn", gl: "BD" } });
+    });
+
+    it("regenerate and template routes are scoped to the owner too", async () => {
+      const ap = makeAutopilot(alice, [a.fb]);
+      const r = await runAutopilot(ap.id, { trigger: "manual", forceFetch: true, forceGenerate: true, fetcher: async () => STORY, ai: null, now: NOW });
+      await expect(regenerateDraft(bob, r.draft_id!, { ai: null, now: NOW })).rejects.toMatchObject({ status: 404 });
+      const tpl = addTemplate(alice, ap.id, { name: "T2", structure: "{headline} {link}" });
+      expect(catchErr(() => updateTemplate(bob, ap.id, tpl.id, { name: "x" }))).toMatchObject({ status: 404 });
+      expect(deleteTemplate(bob, ap.id, tpl.id)).toBe(false); // route turns false into 404
+      expect(updateTemplate(alice, ap.id, tpl.id, { enabled: false })).toMatchObject({ name: "T2", structure: "{headline} {link}", enabled: false });
+      // regenerate refuses drafts that were reviewed meanwhile
+      rejectDraft(alice, r.draft_id!, "");
+      await expect(regenerateDraft(alice, r.draft_id!, { ai: null, now: NOW })).rejects.toMatchObject({ status: 409 });
+    });
+
+    it("limits autopilots per user and AI calls per user across autopilots", async () => {
+      process.env.AUTOPILOT_MAX_PER_USER = "2";
+      process.env.AI_DAILY_CALLS_PER_USER = "1";
+      try {
+        const ap1 = makeAutopilot(alice, [a.fb], { name: "one" });
+        const ap2 = makeAutopilot(alice, [a.fb], { name: "two" });
+        expect(catchErr(() => makeAutopilot(alice, [a.fb], { name: "three" }))).toMatchObject({ status: 409 });
+        const ai: AiClient = async () => JSON.stringify({ facebook: "x" });
+        const r1 = await runAutopilot(ap1.id, { trigger: "manual", forceFetch: true, forceGenerate: true, fetcher: async () => STORY, ai, now: NOW });
+        expect(r1.draft_id).not.toBeNull();
+        const r2 = await runAutopilot(ap2.id, { trigger: "manual", forceFetch: true, forceGenerate: true, fetcher: async () => STORY, ai, now: NOW });
+        expect(r2.draft_id).toBeNull();
+        expect(r2.notes.join(" ")).toMatch(/AI_DAILY_CALLS_PER_USER/);
+        // Bob is unaffected by Alice's usage
+        const bobAp = makeAutopilot(bob, [b.fb]);
+        expect((await runAutopilot(bobAp.id, { trigger: "manual", forceFetch: true, forceGenerate: true, fetcher: async () => STORY, ai, now: NOW })).draft_id).not.toBeNull();
+      } finally {
+        delete process.env.AUTOPILOT_MAX_PER_USER;
+        delete process.env.AI_DAILY_CALLS_PER_USER;
+      }
     });
 
     it("rejects non-AutoPilot platforms and bad windows", () => {

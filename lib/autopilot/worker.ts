@@ -1,5 +1,5 @@
 import { getDb } from "../db";
-import { runAutopilot } from "./pipeline";
+import { pruneOld, runAutopilot } from "./pipeline";
 
 // AutoPilot background loop (RUN_AUTOPILOT=true). Separate from the publisher loop: it only reads
 // sources and the AI model and writes ap_ rows; it never publishes. Stopping it (unset the
@@ -8,11 +8,22 @@ import { runAutopilot } from "./pipeline";
 export const AUTOPILOT_TICK_MS = 60_000;
 
 let running = false;
+let lastPrune = 0;
+const PRUNE_EVERY_MS = 6 * 3_600_000;
 
 /** One pass over every active autopilot of every user who hasn't hit the global pause. */
 export async function autopilotTick(now: Date = new Date()): Promise<{ autopilots: number; drafts: number; errors: number }> {
   if (running) return { autopilots: 0, drafts: 0, errors: 0 };
   running = true;
+  if (Date.now() - lastPrune > PRUNE_EVERY_MS) {
+    lastPrune = Date.now();
+    try {
+      const p = pruneOld(now);
+      if (p.items || p.runs) console.log(`[autopilot] pruned items=${p.items} topics=${p.topics} runs=${p.runs}`);
+    } catch (e) {
+      console.error("[autopilot] prune failed:", e instanceof Error ? e.message : e);
+    }
+  }
   let drafts = 0;
   let errors = 0;
   try {

@@ -56,7 +56,7 @@ export const autopilotInputSchema = z.object({
   auto_threshold: z.number().int().min(0).max(100).default(85),
   max_age_hours: z.number().int().min(1).max(720).default(48),
   min_score: z.number().int().min(0).max(100).default(30),
-  ai_daily_cap: z.number().int().min(0).max(5000).default(200),
+  ai_daily_cap: z.number().int().min(0).max(1000).default(200),
   account_ids: z.array(z.string().min(1).max(100)).max(50).default([]),
   status: z.enum(["active", "paused"]).default("active"),
 });
@@ -165,6 +165,11 @@ export function toTemplate(r: ApTemplateRow): ApTemplate {
 
 // ---------- autopilots ----------
 
+export function maxAutopilotsPerUser(): number {
+  const n = Number(process.env.AUTOPILOT_MAX_PER_USER);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 10;
+}
+
 export function getAutopilotRow(userId: string, id: string): AutopilotRow | undefined {
   return getDb().prepare("SELECT * FROM autopilots WHERE id = ? AND user_id = ?").get(id, userId) as AutopilotRow | undefined;
 }
@@ -207,6 +212,10 @@ export function createAutopilot(
 ): Autopilot {
   const input = autopilotInputSchema.parse(raw);
   checkWindow(input.window_start, input.window_end);
+  const count = (getDb().prepare("SELECT COUNT(*) AS n FROM autopilots WHERE user_id = ?").get(userId) as { n: number }).n;
+  if (count >= maxAutopilotsPerUser()) {
+    throw new HttpError(409, `You can have at most ${maxAutopilotsPerUser()} autopilots (AUTOPILOT_MAX_PER_USER)`);
+  }
   const accounts = checkAccounts(userId, input.account_ids);
   const sources = z.array(sourceInputSchema).max(50).parse(raw.sources ?? []);
   const templates = z.array(templateInputSchema).max(30).parse(raw.templates ?? []);

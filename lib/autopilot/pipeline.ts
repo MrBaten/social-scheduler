@@ -44,17 +44,40 @@ const LOCK_MS = 10 * 60_000;
 const GENERATION_RETRY_MS = 10 * 60_000;
 const REPEAT_SIMILARITY = 0.4;
 
-function acquireLock(id: string, now: Date): boolean {
-  const until = new Date(now.getTime() + LOCK_MS).toISOString();
-  return (
+/** Take the per-autopilot lock. Returns the token (the exact lock_until written) or null. */
+function acquireLock(id: string, now: Date): string | null {
+  const until = new Date(Math.max(now.getTime(), Date.now()) + LOCK_MS).toISOString();
+  const ok =
     getDb()
       .prepare("UPDATE autopilots SET lock_until = ? WHERE id = ? AND (lock_until IS NULL OR lock_until < ?)")
-      .run(until, id, now.toISOString()).changes === 1
-  );
+      .run(until, id, new Date(Math.max(now.getTime(), Date.now())).toISOString()).changes === 1;
+  return ok ? until : null;
 }
 
-function releaseLock(id: string): void {
-  getDb().prepare("UPDATE autopilots SET lock_until = NULL, last_run_at = ? WHERE id = ?").run(nowIso(), id);
+/** Extend the lock while a long run is still working; returns the new token (or the old one if lost). */
+function refreshLock(id: string, token: string): string {
+  const until = new Date(Date.now() + LOCK_MS).toISOString();
+  const ok = getDb().prepare("UPDATE autopilots SET lock_until = ? WHERE id = ? AND lock_until = ?").run(until, id, token).changes === 1;
+  return ok ? until : token;
+}
+
+/** Release only our own lock (compare-and-release), never one another run took over. */
+function releaseLock(id: string, token: string): void {
+  getDb().prepare("UPDATE autopilots SET lock_until = NULL WHERE id = ? AND lock_until = ?").run(id, token);
+  getDb().prepare("UPDATE autopilots SET last_run_at = ? WHERE id = ?").run(nowIso(), id);
+}
+
+/** Process-wide guard on the owner's AI key: calls by all of one user's autopilots in 24 h. */
+export function aiUserDailyLimit(): number {
+  const n = Number(process.env.AI_DAILY_CALLS_PER_USER);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 300;
+}
+
+export function aiCallsLast24hForUser(userId: string, now: Date): number {
+  const r = getDb()
+    .prepare("SELECT COALESCE(SUM(ai_calls), 0) AS n FROM ap_runs WHERE user_id = ? AND started_at >= ?")
+    .get(userId, new Date(now.getTime() - 86_400_000).toISOString()) as { n: number };
+  return r.n;
 }
 
 export function aiCallsToday(ap: AutopilotRow, now: Date): number {
@@ -206,7 +229,8 @@ export async function runAutopilot(autopilotId: string, opts: RunOptions): Promi
   if (opts.trigger === "worker" && (ap0.status !== "active" || isGloballyPaused(ap0.user_id))) {
     return { ...result, skipped_reason: "paused" };
   }
-  if (!acquireLock(ap0.id, now)) return { ...result, skipped_reason: "already running" };
+  let lockToken = acquireLock(ap0.id, now);
+  if (!lockToken) return { ...result, skipped_reason: "already running" };
 
   const runId = newId("run_");
   db.prepare("INSERT INTO ap_runs (id, autopilot_id, user_id, trigger, step, started_at) VALUES (?, ?, ?, ?, 'run', ?)").run(
@@ -216,6 +240,8 @@ export async function runAutopilot(autopilotId: string, opts: RunOptions): Promi
   let aiCalls = 0;
   let error: string | null = null;
   const steps: string[] = [];
+  /** Set when something happened worth keeping in the Activity log even without other steps. */
+  let significant = false;
 
   try {
     result.ran = true;
@@ -224,6 +250,7 @@ export async function runAutopilot(autopilotId: string, opts: RunOptions): Promi
     if (sources.length) steps.push("ingest");
     for (const s of sources) {
       const r = await ingestSource(s, opts.fetcher ?? fetchSourceItems, now);
+      lockToken = refreshLock(ap0.id, lockToken);
       counts.sources_fetched++;
       if (r.error) {
         counts.source_errors++;
@@ -267,6 +294,7 @@ export async function runAutopilot(autopilotId: string, opts: RunOptions): Promi
       if (expired.length) {
         pauseAutopilotSystem(ap.id, `Reconnect ${expired.join(", ")} on the Accounts page, then resume.`);
         result.notes.push(`Paused: account expired (${expired.join(", ")}).`);
+        significant = true;
         generate = false;
       }
     }
@@ -278,6 +306,11 @@ export async function runAutopilot(autopilotId: string, opts: RunOptions): Promi
     if (generate && ai && aiCallsToday(ap, now) >= ap.ai_daily_cap) {
       pauseAutopilotSystem(ap.id, `AI daily cap of ${ap.ai_daily_cap} calls reached. Resume tomorrow or raise the cap in Settings.`);
       result.notes.push("Paused: AI daily cap reached.");
+      significant = true;
+      generate = false;
+    }
+    if (generate && ai && aiCallsLast24hForUser(ap.user_id, now) >= aiUserDailyLimit()) {
+      result.notes.push(`Account-wide AI limit of ${aiUserDailyLimit()} calls per 24 h reached (AI_DAILY_CALLS_PER_USER); no draft written.`);
       generate = false;
     }
 
@@ -324,10 +357,11 @@ export async function runAutopilot(autopilotId: string, opts: RunOptions): Promi
       error,
       runId,
     );
-    releaseLock(ap0.id);
+    releaseLock(ap0.id, lockToken);
   }
-  // Drop no-op worker runs so the Activity log shows only runs that did something.
-  if (opts.trigger === "worker" && !error && steps.length === 0 && result.notes.length === 0) {
+  // Keep only worker runs that did something (fetched, scored, generated, failed, or paused the
+  // autopilot). "No topic yet" checks happen every minute while a slot is open and would flood the log.
+  if (opts.trigger === "worker" && !error && steps.length === 0 && !significant) {
     db.prepare("DELETE FROM ap_runs WHERE id = ?").run(runId);
   }
   return { ...result, counts, error };
@@ -350,6 +384,9 @@ export async function regenerateDraft(userId: string, draftId: string, opts: { a
   if (ai && aiCallsToday(ap, now) >= ap.ai_daily_cap) {
     throw new HttpError(429, `AI daily cap of ${ap.ai_daily_cap} calls reached`);
   }
+  if (ai && aiCallsLast24hForUser(userId, now) >= aiUserDailyLimit()) {
+    throw new HttpError(429, `Account-wide AI limit of ${aiUserDailyLimit()} calls per 24 h reached`);
+  }
   const runId = newId("run_");
   db.prepare("INSERT INTO ap_runs (id, autopilot_id, user_id, trigger, step, started_at) VALUES (?, ?, ?, 'manual', 'regenerate', ?)").run(
     runId, ap.id, userId, now.toISOString(),
@@ -357,11 +394,17 @@ export async function regenerateDraft(userId: string, draftId: string, opts: { a
   let error: string | null = null;
   try {
     const g = await writeDraftTexts({ ap, topic, item }, ai);
-    db.prepare("UPDATE ap_drafts SET texts_json = ?, qc_flags_json = ?, generator = ?, template_id = COALESCE(?, template_id), updated_at = ? WHERE id = ?").run(
-      JSON.stringify(g.texts), JSON.stringify(g.flags), g.generator, g.template?.id ?? null, nowIso(), draftId,
-    );
+    // Only while still in review: if it was approved/rejected during the AI call, leave it alone.
+    const changed = db
+      .prepare(
+        `UPDATE ap_drafts SET texts_json = ?, qc_flags_json = ?, generator = ?, template_id = COALESCE(?, template_id), updated_at = ?
+         WHERE id = ? AND user_id = ? AND status = 'in_review'`,
+      )
+      .run(JSON.stringify(g.texts), JSON.stringify(g.flags), g.generator, g.template?.id ?? null, nowIso(), draftId, userId).changes;
+    if (changed !== 1) throw new HttpError(409, "This draft was reviewed while it was being regenerated");
   } catch (e) {
     error = sanitizeError(e instanceof Error ? e.message : String(e));
+    if (e instanceof HttpError) throw e;
     throw new HttpError(502, error);
   } finally {
     db.prepare("UPDATE ap_runs SET finished_at = ?, ai_calls = ?, error = ?, counts_json = '{}' WHERE id = ?").run(nowIso(), ai ? 1 : 0, error, runId);
@@ -407,4 +450,22 @@ export function summarizeAutopilots(userId: string, now: Date = new Date()): Aut
       expired_accounts: expiredAccounts(r),
     };
   });
+}
+
+// ---------- housekeeping ----------
+
+/** Items and topics older than this are deleted (drafts keep their own copy of the story). */
+export const KEEP_ITEMS_DAYS = 14;
+export const KEEP_RUNS_DAYS = 30;
+
+/** Bound table growth on the SQLite volume. Safe any time: dedupe and topics only look back 72 h. */
+export function pruneOld(now: Date = new Date()): { items: number; topics: number; runs: number } {
+  const db = getDb();
+  const itemsCutoff = new Date(now.getTime() - KEEP_ITEMS_DAYS * 86_400_000).toISOString();
+  const runsCutoff = new Date(now.getTime() - KEEP_RUNS_DAYS * 86_400_000).toISOString();
+  return db.transaction(() => ({
+    items: db.prepare("DELETE FROM ap_items WHERE fetched_at < ?").run(itemsCutoff).changes,
+    topics: db.prepare("DELETE FROM ap_topics WHERE last_seen_at < ?").run(itemsCutoff).changes,
+    runs: db.prepare("DELETE FROM ap_runs WHERE started_at < ?").run(runsCutoff).changes,
+  }))();
 }

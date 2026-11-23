@@ -6,36 +6,91 @@ import { htmlToText, truncate } from "./text";
 // feeds in the wild are not well-formed XML).
 
 const SUMMARY_MAX = 600;
+/** Never look at more than this many items per feed. */
+export const MAX_FEED_ITEMS = 200;
+
+// All scanning below uses indexOf on a lowercased copy: linear time whatever the input, so a
+// hostile or broken feed (e.g. 100k unclosed <item> tags) can't stall the shared server process.
 
 function stripCdata(s: string): string {
-  return s.replace(/^\s*<!\[CDATA\[([\s\S]*?)\]\]>\s*$/, "$1");
+  const t = s.trim();
+  return t.startsWith("<![CDATA[") && t.endsWith("]]>") ? t.slice(9, -3) : s;
+}
+
+/** Position of the next opening `<tag` (followed by whitespace, ">" or "/") at or after `from`. */
+function findOpen(lower: string, tag: string, from: number): number {
+  const needle = "<" + tag;
+  let i = from;
+  for (;;) {
+    const p = lower.indexOf(needle, i);
+    if (p < 0) return -1;
+    const next = lower.charCodeAt(p + needle.length);
+    // ">"=62 "/"=47 space/tab/newline/cr
+    if (next === 62 || next === 47 || next === 32 || next === 9 || next === 10 || next === 13) return p;
+    i = p + needle.length;
+  }
+}
+
+/** Contents of each <tag ...>...</tag> at the top level of `xml`, at most `max`. */
+function blocks(xml: string, tag: string, max = MAX_FEED_ITEMS): string[] {
+  const lower = xml.toLowerCase();
+  const close = `</${tag}`;
+  const out: string[] = [];
+  let i = 0;
+  while (out.length < max) {
+    const start = findOpen(lower, tag, i);
+    if (start < 0) break;
+    const gt = lower.indexOf(">", start);
+    if (gt < 0) break;
+    const end = lower.indexOf(close, gt + 1);
+    if (end < 0) break; // unclosed: stop, the rest of the document is not a valid block
+    out.push(xml.slice(gt + 1, end));
+    i = end + close.length;
+  }
+  return out;
 }
 
 /** Inner content of the first <tag ...>...</tag> (namespace prefix allowed in `tag`). */
 function tagContent(block: string, tag: string): string | null {
-  const esc = tag.replace(/[:.]/g, (c) => "\\" + c);
-  const m = block.match(new RegExp(`<${esc}(?:\\s[^>]*)?>([\\s\\S]*?)</${esc}\\s*>`, "i"));
-  return m ? stripCdata(m[1]) : null;
+  const lower = block.toLowerCase();
+  const t = tag.toLowerCase();
+  const start = findOpen(lower, t, 0);
+  if (start < 0) return null;
+  const gt = lower.indexOf(">", start);
+  if (gt < 0 || lower.charCodeAt(gt - 1) === 47 /* self-closing */) return null;
+  const end = lower.indexOf(`</${t}`, gt + 1);
+  if (end < 0) return null;
+  return stripCdata(block.slice(gt + 1, end));
 }
 
+function attrValue(tagSrc: string, attr: string): string | null {
+  const m = tagSrc.match(new RegExp(`\\b${attr}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, "i"));
+  return m ? (m[1] ?? m[2] ?? null) : null;
+}
+
+/** Attribute of the first <tag ...> whose attributes pass `filter`. */
 function tagAttr(block: string, tag: string, attr: string, filter?: (tagSrc: string) => boolean): string | null {
-  const esc = tag.replace(/[:.]/g, (c) => "\\" + c);
-  const re = new RegExp(`<${esc}\\b([^>]*)\\/?>`, "gi");
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(block))) {
-    if (filter && !filter(m[1])) continue;
-    const a = m[1].match(new RegExp(`\\b${attr}\\s*=\\s*("([^"]*)"|'([^']*)')`, "i"));
-    if (a) return a[2] ?? a[3] ?? null;
+  const lower = block.toLowerCase();
+  let i = 0;
+  for (let n = 0; n < 50; n++) {
+    const start = findOpen(lower, tag.toLowerCase(), i);
+    if (start < 0) return null;
+    const gt = lower.indexOf(">", start);
+    if (gt < 0) return null;
+    // Attribute text is bounded by this tag, so the small regex in attrValue stays linear.
+    const src = block.slice(start + tag.length + 1, gt);
+    i = gt + 1;
+    if (filter && !filter(src)) continue;
+    const v = attrValue(src, attr);
+    if (v !== null) return v;
   }
   return null;
 }
 
-function blocks(xml: string, tag: string): string[] {
-  const re = new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)</${tag}\\s*>`, "gi");
-  const out: string[] = [];
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(xml))) out.push(m[1]);
-  return out;
+/** True when the body looks like RSS, RDF or Atom (even with zero items). */
+export function looksLikeFeed(xml: string): boolean {
+  const head = xml.slice(0, 4096).toLowerCase();
+  return head.includes("<rss") || head.includes("<rdf:rdf") || head.includes("<feed") || head.includes("<channel");
 }
 
 export function parseDate(s: string | null | undefined): string | null {
@@ -60,14 +115,19 @@ export function stripPublisherSuffix(title: string, publisher: string): string {
 
 /** Parse RSS 2.0, RSS 1.0/RDF or Atom. Unknown/garbage input -> []. */
 export function parseFeed(xml: string): { title: string; items: FeedItem[] } {
-  const isAtom = /<feed[\s>]/i.test(xml) && /<entry[\s>]/i.test(xml);
-  const channelTitle = text(tagContent(xml.replace(/<(item|entry)[\s\S]*$/i, ""), "title"));
+  const lower = xml.toLowerCase();
+  const isAtom = findOpen(lower, "feed", 0) >= 0 && findOpen(lower, "entry", 0) >= 0;
+  const firstItem = Math.min(...[findOpen(lower, "item", 0), findOpen(lower, "entry", 0)].map((p) => (p < 0 ? xml.length : p)));
+  const channelTitle = text(tagContent(xml.slice(0, firstItem), "title"));
   const items: FeedItem[] = [];
 
   if (isAtom) {
     for (const b of blocks(xml, "entry")) {
       const link =
-        tagAttr(b, "link", "href", (src) => !/\brel\s*=/.test(src) || /\brel\s*=\s*["']alternate["']/i.test(src)) ??
+        tagAttr(b, "link", "href", (src) => {
+          const rel = attrValue(src, "rel");
+          return rel === null || rel.toLowerCase() === "alternate";
+        }) ??
         tagAttr(b, "link", "href") ??
         "";
       const title = text(tagContent(b, "title"));
@@ -133,6 +193,7 @@ export function parseGdelt(body: string): FeedItem[] {
   }
   const arts = (data as { articles?: unknown })?.articles;
   if (!Array.isArray(arts)) return [];
+  arts.length = Math.min(arts.length, MAX_FEED_ITEMS);
   const out: FeedItem[] = [];
   for (const a of arts) {
     if (!a || typeof a !== "object") continue;

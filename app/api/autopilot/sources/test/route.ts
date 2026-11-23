@@ -18,7 +18,8 @@ export async function POST(request: Request) {
     const cfg = { type: s.type as ApSourceType, url: s.url, query: s.query, params: s.params };
     const requestUrl = SOURCE_ADAPTERS[cfg.type].requestUrl(cfg);
     try {
-      const items = await fetchSourceItems(cfg);
+      // Feed URLs are attacker-controlled: only http(s) links go back to the browser.
+      const items = (await fetchSourceItems(cfg)).filter((i) => /^https?:\/\//i.test(i.url));
       return { ok: true, request_url: requestUrl, count: items.length, items: items.slice(0, 15) };
     } catch (e) {
       return { ok: false, request_url: requestUrl, count: 0, items: [], error: e instanceof Error ? e.message : String(e) };

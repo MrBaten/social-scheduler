@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS ap_items (
 CREATE INDEX IF NOT EXISTS idx_ap_items_status ON ap_items(autopilot_id, status);
 CREATE INDEX IF NOT EXISTS idx_ap_items_title ON ap_items(autopilot_id, title_key);
 CREATE INDEX IF NOT EXISTS idx_ap_items_topic ON ap_items(topic_id);
+CREATE INDEX IF NOT EXISTS idx_ap_items_fetched ON ap_items(autopilot_id, fetched_at);
 
 CREATE TABLE IF NOT EXISTS ap_templates (
   id TEXT PRIMARY KEY,
@@ -169,16 +170,26 @@ function hasColumn(db: Database.Database, table: string, column: string): boolea
   return cols.some((c) => c.name === column);
 }
 
-/** Idempotent: creates ap_ tables and adds posts.origin / posts.ap_draft_id when missing. */
+/**
+ * Idempotent: creates ap_ tables and adds posts.origin / posts.ap_draft_id when missing. Runs in
+ * one IMMEDIATE transaction, so two processes starting at once can't both try the ALTER; a
+ * "duplicate column" from any other race is ignored rather than breaking getDb() for the publisher.
+ */
 export function migrateAutopilot(db: Database.Database): void {
-  db.exec(AUTOPILOT_SCHEMA);
-  if (!hasColumn(db, "posts", "origin")) {
-    db.exec("ALTER TABLE posts ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'");
+  db.transaction(() => {
+    db.exec(AUTOPILOT_SCHEMA);
+    addColumn(db, "posts", "origin", "TEXT NOT NULL DEFAULT 'manual'");
+    // Plain TEXT (no FK): ap_drafts.post_id already carries the ON DELETE SET NULL link the other way.
+    addColumn(db, "posts", "ap_draft_id", "TEXT");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_posts_ap_draft ON posts(ap_draft_id)");
+  }).immediate();
+}
+
+function addColumn(db: Database.Database, table: string, column: string, decl: string): void {
+  if (hasColumn(db, table, column)) return;
+  try {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+  } catch (e) {
+    if (!(e instanceof Error && /duplicate column/i.test(e.message))) throw e;
   }
-  if (!hasColumn(db, "posts", "ap_draft_id")) {
-    // Plain TEXT (no FK): ALTER TABLE can't add a constrained column safely on every SQLite build,
-    // and ap_drafts.post_id already carries the ON DELETE SET NULL link the other way.
-    db.exec("ALTER TABLE posts ADD COLUMN ap_draft_id TEXT");
-  }
-  db.exec("CREATE INDEX IF NOT EXISTS idx_posts_ap_draft ON posts(ap_draft_id)");
 }

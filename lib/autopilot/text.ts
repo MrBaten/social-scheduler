@@ -62,13 +62,49 @@ export function decodeEntities(s: string): string {
   });
 }
 
+/**
+ * Replace every open...close span (case-insensitive `open`) using indexOf scans: linear time, so a
+ * hostile feed full of unclosed tags can't trigger regex backtracking. Unclosed spans run to the end.
+ */
+function replaceSpans(s: string, open: string, close: string, fn: (inner: string) => string): string {
+  const lower = s.toLowerCase();
+  const o = open.toLowerCase();
+  const c = close.toLowerCase();
+  let out = "";
+  let i = 0;
+  for (;;) {
+    const start = lower.indexOf(o, i);
+    if (start < 0) break;
+    const innerStart = start + o.length;
+    const end = lower.indexOf(c, innerStart);
+    out += s.slice(i, start) + fn(s.slice(innerStart, end < 0 ? s.length : end));
+    if (end < 0) return out;
+    i = end + c.length;
+  }
+  return out + s.slice(i);
+}
+
+/** Remove <...> tags in one pass (a "<" with no closing ">" is dropped with the rest of the text). */
+function stripTags(s: string): string {
+  let out = "";
+  let i = 0;
+  for (;;) {
+    const lt = s.indexOf("<", i);
+    if (lt < 0) return out + s.slice(i);
+    out += s.slice(i, lt) + " ";
+    const gt = s.indexOf(">", lt + 1);
+    if (gt < 0) return out;
+    i = gt + 1;
+  }
+}
+
 /** Strip tags (after decoding, since feeds often double-encode HTML) and collapse whitespace. */
 export function htmlToText(s: string): string {
-  let t = s.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1");
+  let t = replaceSpans(s, "<![CDATA[", "]]>", (x) => x);
   t = decodeEntities(t);
-  t = t.replace(/<(script|style)[\s\S]*?<\/\1>/gi, " ");
-  t = t.replace(/<br\s*\/?>|<\/p>/gi, " ");
-  t = t.replace(/<[^>]+>/g, " ");
+  t = replaceSpans(t, "<script", "</script>", () => " ");
+  t = replaceSpans(t, "<style", "</style>", () => " ");
+  t = stripTags(t);
   t = decodeEntities(t); // entities that were inside the encoded HTML
   return t.replace(/\s+/g, " ").trim();
 }

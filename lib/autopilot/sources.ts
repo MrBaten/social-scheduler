@@ -1,5 +1,5 @@
 import type { ApSourceParams, ApSourceType, FeedItem } from "./types";
-import { parseFeed, parseGdelt } from "./feeds";
+import { looksLikeFeed, parseFeed, parseGdelt } from "./feeds";
 import { fetchText } from "./fetcher";
 
 // Source adapters. Each kind knows how to validate its config, build a request URL and parse
@@ -46,18 +46,24 @@ export function gdeltUrl(query: string, p: ApSourceParams = {}): string {
   return `https://api.gdeltproject.org/api/v2/doc/doc?${qs.toString()}`;
 }
 
+/** A body that isn't RSS/Atom (an HTML page, an error page) is a failure, so it counts toward auto-pause. */
+function parseFeedStrict(body: string): FeedItem[] {
+  if (!looksLikeFeed(body)) throw new Error("Not an RSS/Atom feed (the URL returned a web page or something else)");
+  return parseFeed(body).items;
+}
+
 export const SOURCE_ADAPTERS: Record<ApSourceType, SourceAdapter> = {
   rss: {
     label: "RSS / Atom feed",
     validate: (c) => (c.url && /^https?:\/\//i.test(c.url.trim()) ? null : "Enter the feed URL (http or https)"),
     requestUrl: (c) => c.url!.trim(),
-    parse: (body) => parseFeed(body).items,
+    parse: parseFeedStrict,
   },
   google_news: {
     label: "Google News search",
     validate: (c) => (c.query?.trim() ? null : "Enter a search query"),
     requestUrl: (c) => googleNewsUrl(c.query!.trim(), c.params),
-    parse: (body) => parseFeed(body).items,
+    parse: parseFeedStrict,
   },
   gdelt: {
     label: "GDELT search",
@@ -70,7 +76,10 @@ export const SOURCE_ADAPTERS: Record<ApSourceType, SourceAdapter> = {
   },
 };
 
-const lastRequestAt = new Map<ApSourceType, number>();
+// Process-wide (globalThis), so the worker loop and the "Run now"/"Test" routes share one throttle
+// even if the bundler gives them separate copies of this module.
+const g = globalThis as unknown as { __apLastRequestAt?: Map<ApSourceType, number> };
+const lastRequestAt = (g.__apLastRequestAt ??= new Map<ApSourceType, number>());
 
 async function respectGap(type: ApSourceType, gap: number | undefined): Promise<void> {
   if (!gap) return;
@@ -88,6 +97,7 @@ export const fetchSourceItems: SourceFetcher = async (c) => {
   const err = adapter.validate(c);
   if (err) throw new Error(err);
   await respectGap(c.type, adapter.minGapMs);
+  // fetchText caps the body at 2 MB and the parsers scan linearly and stop at 200 items.
   const body = await fetchText(adapter.requestUrl(c), c.type === "gdelt" ? "application/json" : undefined);
   return adapter.parse(body);
 };

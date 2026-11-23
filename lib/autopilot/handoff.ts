@@ -2,6 +2,8 @@ import { z } from "zod";
 import { getDb, nowIso } from "../db";
 import { HttpError } from "../api";
 import { createPost } from "../posts";
+import { getMediaItems } from "../media";
+import { validateForPlatform } from "../platforms";
 import type { PostWithTargets, SocialAccountRow } from "../types";
 import type { ApDraft, ApPlatform, DraftTexts } from "./types";
 import { AP_PLATFORMS } from "./types";
@@ -78,6 +80,7 @@ export function approveDraft(userId: string, draftId: string, raw: ApproveInput 
 
   const skipped: ApproveResult["skipped"] = [];
   const targets: { social_account_id: string; text_override: string }[] = [];
+  const mediaItems = image ? getMediaItems(userId, [image.id]) : [];
   for (const a of accounts) {
     const p = a.platform as ApPlatform;
     if (opts.platforms && !opts.platforms.includes(p)) continue;
@@ -89,6 +92,20 @@ export function approveDraft(userId: string, draftId: string, raw: ApproveInput 
     if (p === "instagram" && !image) {
       skipped.push({ account: a.display_name, platform: p, reason: "Instagram needs an image: attach one to include it" });
       continue;
+    }
+    // The image is shared by every platform of the post. If THIS platform can't take it (e.g.
+    // Instagram: JPEG only; LinkedIn: no WebP) but would be fine without it, leave this platform
+    // out instead of failing the whole post. Other errors (e.g. text too long) still fail below.
+    if (mediaItems.length) {
+      const withImage = validateForPlatform(p, { text, media: mediaItems, options: {} });
+      const imageIsTheProblem =
+        withImage.length > 0 &&
+        // Instagram can't post without media at all, so any image error is the image's fault.
+        (p === "instagram" || validateForPlatform(p, { text, media: [], options: {} }).length === 0);
+      if (imageIsTheProblem) {
+        skipped.push({ account: a.display_name, platform: p, reason: withImage.join(" ") });
+        continue;
+      }
     }
     targets.push({ social_account_id: a.id, text_override: text });
   }

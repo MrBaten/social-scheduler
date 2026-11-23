@@ -206,6 +206,15 @@ function WeekGrid({ days, posts }: { days: Date[]; posts: PostWithTargets[] }) {
   );
 }
 
+function AutopilotBadge({ post }: { post: PostWithTargets }) {
+  if (post.origin !== "autopilot") return null;
+  return (
+    <span className="inline-flex items-center rounded-full border border-violet-200 bg-violet-100 px-1.5 py-0.5 text-[10px] font-semibold text-violet-800" title="Created by AutoPilot">
+      AutoPilot
+    </span>
+  );
+}
+
 function PostCard({ post, compact }: { post: PostWithTargets; compact?: boolean }) {
   return (
     <Link
@@ -213,7 +222,10 @@ function PostCard({ post, compact }: { post: PostWithTargets; compact?: boolean 
       className="block rounded-lg border border-gray-200 bg-white p-2.5 shadow-sm transition hover:border-indigo-300 hover:shadow"
     >
       <div className="flex items-center justify-between gap-2">
-        <span className="text-xs font-semibold text-gray-900">{post.scheduled_at ? timeLabel(post.scheduled_at) : "Draft"}</span>
+        <span className="flex items-center gap-1.5 text-xs font-semibold text-gray-900">
+          {post.scheduled_at ? timeLabel(post.scheduled_at) : "Draft"}
+          <AutopilotBadge post={post} />
+        </span>
         {!compact && <StatusPill status={post.status} />}
         {compact && post.status !== "scheduled" && <StatusPill status={post.status} className="px-1.5! text-[10px]!" />}
       </div>
@@ -277,6 +289,7 @@ function Section({ title, posts, empty }: { title: string; posts: PostWithTarget
                 </div>
                 <p className="min-w-0 flex-1 truncate text-sm text-gray-700">{snippet(p)}</p>
                 <div className="flex flex-wrap items-center gap-1.5 sm:justify-end">
+                  <AutopilotBadge post={p} />
                   {p.targets.map((t) => (
                     <PlatformBadge key={t.id} platform={t.platform} status={t.status} />
                   ))}

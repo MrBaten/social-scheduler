@@ -76,6 +76,31 @@ developers.tiktok.com → app with **Login Kit** + **Content Posting API** (Dire
 `TIKTOK_CLIENT_KEY/SECRET`. Until TikTok audits the app, posts are private (`SELF_ONLY`), the account must be private,
 and at most 5 users per 24h can post.
 
+## AutoPilot (auto post creation, Phase 1)
+
+A separate module at **/autopilot** (switch with *Scheduler | AutoPilot* in the sidebar). Same login, accounts and
+queue. It watches free news sources (RSS/Atom feeds, Google News RSS searches, GDELT), groups coverage of the same story,
+scores it against your niche, and writes per-platform drafts (Facebook, Instagram, LinkedIn) into a **Review inbox**.
+**Approve** turns a draft into a normal post in the Queue (with an *AutoPilot* badge); the existing scheduler publishes it.
+Nothing is posted without your approval in Phase 1.
+
+| Part | Where |
+|---|---|
+| Screens: Overview, New autopilot wizard, Inbox, Sources, Templates, Activity, Settings | `app/(autopilot)/*`, `components/autopilot/*` |
+| API | `app/api/autopilot/*` |
+| Tables `autopilots`, `ap_sources`, `ap_items`, `ap_topics`, `ap_templates`, `ap_drafts`, `ap_runs`, `ap_settings` + `posts.origin`, `posts.ap_draft_id` | `lib/autopilot/schema.ts` (auto-migrates on start) |
+| Pipeline: ingest → exact dedupe → story grouping → relevance → pick topic for open slot → generate | `lib/autopilot/{ingest,relevance,pipeline,generate}.ts` |
+| Source adapters (add Feedly etc. here) | `lib/autopilot/sources.ts` |
+| AI providers | `lib/autopilot/ai.ts` |
+| Approve → queue hand-off | `lib/autopilot/handoff.ts` |
+| Worker loop (`RUN_AUTOPILOT=true`, separate from the publisher) | `lib/autopilot/worker.ts`, started in `instrumentation.ts` |
+
+Variables: `RUN_AUTOPILOT`, `AI_PROVIDER`, `AI_API_KEY`, `AI_MODEL`, `AI_BASE_URL` (see `.env.example`). Without
+`AI_API_KEY` drafts are filled straight from the template and flagged *No AI*.
+
+Phase 1 limits: story grouping uses word overlap (no embeddings yet); quality checks are basic flags (no AI review score);
+no image cards, so Instagram is included only when you attach an image at approval; Assisted / Full-auto modes are Phase 3.
+
 ## Known limits (demo build)
 
 - SQLite + local disk: one server instance. For scale, move to Postgres (e.g. Supabase) and object storage.

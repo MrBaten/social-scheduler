@@ -11,7 +11,7 @@ const NAV = [
   { href: "/accounts", label: "Accounts", icon: IconLink },
 ];
 
-function useLogout() {
+export function useLogout() {
   const router = useRouter();
   const [busy, setBusy] = useState(false);
   const logout = async () => {
@@ -39,7 +39,8 @@ export function SidebarNav({ userName, userEmail }: { userName: string; userEmai
   return (
     <div className="flex h-full flex-col">
       <Brand />
-      <nav className="mt-8 flex flex-col gap-1" aria-label="Main">
+      <AppSwitcher className="mt-4" />
+      <nav className="mt-6 flex flex-col gap-1" aria-label="Main">
         {NAV.map(({ href, label, icon: Icon }) => {
           const active = isActive(pathname, href);
           return (
@@ -99,6 +100,7 @@ export function TopNav({ userName }: { userName: string }) {
           </button>
         </div>
       </div>
+      <AppSwitcher className="mt-3" />
       <nav className="mt-3 flex gap-1 overflow-x-auto" aria-label="Main">
         {NAV.map(({ href, label }) => {
           const active = isActive(pathname, href);
@@ -120,6 +122,26 @@ export function TopNav({ userName }: { userName: string }) {
   );
 }
 
+/** Segmented control switching between the Scheduler and the AutoPilot module. */
+export function AppSwitcher({ className = "" }: { className?: string }) {
+  const pathname = usePathname() ?? "";
+  const onAutopilot = pathname === "/autopilot" || pathname.startsWith("/autopilot/");
+  const item = (active: boolean) =>
+    `flex-1 rounded-md px-3 py-1.5 text-center text-xs font-semibold transition-colors ${
+      active ? "bg-white text-gray-900 shadow-sm" : "text-gray-600 hover:text-gray-900"
+    }`;
+  return (
+    <nav className={`flex rounded-lg bg-gray-100 p-1 ${className}`} aria-label="Switch module">
+      <Link href="/compose" className={item(!onAutopilot)} aria-current={!onAutopilot ? "page" : undefined}>
+        Scheduler
+      </Link>
+      <Link href="/autopilot" className={item(onAutopilot)} aria-current={onAutopilot ? "page" : undefined}>
+        AutoPilot
+      </Link>
+    </nav>
+  );
+}
+
 export function Brand() {
   return (
     <Link href="/compose" className="flex items-center gap-2">
@@ -134,7 +156,7 @@ export function Brand() {
   );
 }
 
-function Avatar({ name }: { name: string }) {
+export function Avatar({ name }: { name: string }) {
   const initials =
     name
       .split(/\s+/)

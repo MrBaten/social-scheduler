@@ -17,6 +17,12 @@ export async function register(): Promise<void> {
       if (!process.env.CRON_SECRET) console.warn("[startup] CRON_SECRET is not set: /api/cron/publish is disabled");
     }
 
+    // AutoPilot drafting loop: independent of the publisher below (it never publishes).
+    if (process.env.RUN_AUTOPILOT === "true") {
+      const { startAutopilotWorker } = await import("./lib/autopilot/worker");
+      startAutopilotWorker();
+    }
+
     if (process.env.RUN_WORKER_IN_PROCESS !== "true") return;
     const { processDuePosts } = await import("./lib/scheduler");
     const intervalMs = Math.max(1000, Number(process.env.WORKER_INTERVAL_MS) || 30_000);

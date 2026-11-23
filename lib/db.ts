@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { migrateAutopilot } from "./autopilot/schema";
 
 // SQLite for the local demo. The schema is plain SQL so it ports to Postgres (Supabase)
 // with minor type changes (TEXT ids stay TEXT, INTEGER flags -> BOOLEAN).
@@ -114,6 +115,7 @@ export function getDb(): Database.Database {
   db.pragma("foreign_keys = ON");
   db.pragma("busy_timeout = 5000");
   db.exec(SCHEMA);
+  migrateAutopilot(db);
   _db = db;
   return db;
 }
@@ -123,6 +125,7 @@ export function resetDbForTests(): Database.Database {
   const db = new Database(":memory:");
   db.pragma("foreign_keys = ON");
   db.exec(SCHEMA);
+  migrateAutopilot(db);
   _db = db;
   return db;
 }

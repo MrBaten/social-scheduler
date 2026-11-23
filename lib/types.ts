@@ -139,6 +139,10 @@ export interface PostRow {
   status: PostStatus;
   created_at: string;
   updated_at: string;
+  /** Who created the post. Added by the AutoPilot migration; "manual" for everything else. */
+  origin?: "manual" | "autopilot";
+  /** ap_drafts.id when origin = "autopilot". */
+  ap_draft_id?: string | null;
 }
 
 export interface PostTargetRow {

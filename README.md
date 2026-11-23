@@ -59,6 +59,9 @@ Every OAuth redirect/callback URL is `${APP_URL}/api/oauth/<provider>/callback`.
 5. Instagram must be a **Business/Creator** account linked to a Facebook Page. Images must be JPEG, and media must be
    reachable at a public URL (`APP_URL`).
 6. Set `META_APP_ID`, `META_APP_SECRET`.
+7. If the app uses **Facebook Login for Business** (Business-type apps do), create a configuration under
+   Facebook Login for Business → Configurations (token type: *User access token*; permissions as above) and set
+   `META_LOGIN_CONFIG_ID` to its ID. The login dialog then sends `config_id` instead of a scope list.
 
 **LinkedIn**: provider `linkedin`
 Create an app → add products **Sign In with LinkedIn using OpenID Connect** and **Share on LinkedIn** → add the redirect
@@ -76,7 +79,8 @@ and at most 5 users per 24h can post.
 ## Known limits (demo build)
 
 - SQLite + local disk: one server instance. For scale, move to Postgres (e.g. Supabase) and object storage.
-- No rate limiting on login/signup; signup is open.
+- Login/signup are rate-limited in memory (per server). Close sign-ups with `SIGNUP_ENABLED=false`
+  or restrict to `ALLOWED_EMAILS`.
 - Deleting posts/accounts doesn't delete uploaded files yet.
 - Real-API paths are written against current docs but have not yet been run against live platforms.
   Items still marked `// VERIFY:` in `lib/platforms/*` should be confirmed during the first real test.

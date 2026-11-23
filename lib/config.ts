@@ -11,11 +11,22 @@ export const config = {
   /** Force demo mode for every provider even if keys exist. */
   forceDemo: process.env.DEMO_MODE === "true",
   cronSecret: process.env.CRON_SECRET || "",
+  /** SIGNUP_ENABLED=false closes sign-up (existing users can still log in). */
+  signupEnabled: process.env.SIGNUP_ENABLED !== "false",
+  /** Optional comma-separated allowlist. When set, only these emails can sign up or log in. */
+  allowedEmails: (process.env.ALLOWED_EMAILS || "")
+    .split(",")
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean),
   maxUploadBytes: Number(process.env.MAX_UPLOAD_MB || 200) * 1024 * 1024,
   meta: {
     appId: process.env.META_APP_ID || "",
     appSecret: process.env.META_APP_SECRET || "",
     graphVersion: process.env.META_GRAPH_VERSION || "v25.0",
+    /** Facebook Login for Business configuration ID. When set, the login dialog sends
+     *  config_id instead of a scope list (Business-type apps require this). Create it in
+     *  App Dashboard -> Facebook Login for Business -> Configurations, token type "User access token". */
+    loginConfigId: process.env.META_LOGIN_CONFIG_ID || "",
   },
   linkedin: {
     clientId: process.env.LINKEDIN_CLIENT_ID || "",

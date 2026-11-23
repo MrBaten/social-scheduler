@@ -73,8 +73,11 @@ export const metaProvider: ProviderAdapter = {
       redirect_uri: redirectUri,
       state,
       response_type: "code",
-      scope: SCOPES.join(","),
     });
+    // Facebook Login for Business (Business-type apps) authorizes with a saved configuration
+    // (config_id) instead of a scope list; classic Facebook Login uses scope.
+    if (config.meta.loginConfigId) p.set("config_id", config.meta.loginConfigId);
+    else p.set("scope", SCOPES.join(","));
     return `https://www.facebook.com/${config.meta.graphVersion}/dialog/oauth?${p}`;
   },
   async exchangeCode({ code, redirectUri }) {

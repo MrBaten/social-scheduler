@@ -110,7 +110,14 @@ export function AuthForm({ mode }: { mode: "login" | "signup" }) {
                 Create an account
               </Link>
             </>
-          )}
+                    )}
+        </p>
+        <p className="mt-3 text-center text-xs text-gray-400">
+          <Link href="/privacy" className="hover:text-gray-600">Privacy Policy</Link>
+          {" · "}
+          <Link href="/terms" className="hover:text-gray-600">Terms</Link>
+          {" · "}
+          <Link href="/data-deletion" className="hover:text-gray-600">Data Deletion</Link>
         </p>
       </div>
     </div>
